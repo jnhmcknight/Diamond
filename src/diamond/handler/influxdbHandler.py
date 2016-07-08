@@ -16,11 +16,7 @@ v1.2 : added a timer to delay influxdb writing in case of failure
 
 #### Configuration
 ```
-
-handlers = diamond.handler.influxdbHandler.InfluxdbHandler
-
 [[InfluxdbHandler]]
-client = influxdb09
 hostname = localhost
 port = 8086 #8084 for HTTPS
 batch_size = 100 # default to 1
@@ -29,12 +25,23 @@ username = root
 password = root
 database = graphite
 time_precision = s
-
+influxdb_version = 0.9
 ```
 """
 
+from six import integer_types
 import time
 from Handler import Handler
+
+try:
+    from influxdb.client import InfluxDBClient
+except ImportError:
+    InfluxDBClient = None
+
+try:
+    from influxdb.influxdb08 import InfluxDBClient as InfluxDB08Client
+except ImportError:
+    InfluxDB08Client = None
 
 class InfluxdbHandler(Handler):
     """
@@ -47,32 +54,6 @@ class InfluxdbHandler(Handler):
         """
         # Initialize Handler
         Handler.__init__(self, config)
-
-        self.client = self.config['client']
-
-        self._build_payload = self._build_payload_influxdb09
-
-        if self.client == 'influxdb08':
-            try:
-                from influxdb.influxdb08 import InfluxDBClient as InfluxDBClient08
-                self._InfluxDBClient = InfluxDBClient08
-                self._build_payload = self._build_payload_influxdb08
-
-            except ImportError:
-                self.log.error('influxdb.influxdb08.InfluxDBClient import failed. '
-                               'Handler disabled')
-                self.enabled = False
-                return
-
-        else:
-            try:
-                from influxdb.client import InfluxDBClient as InfluxDBClient09
-                self._InfluxDBClient = InfluxDBClient09
-            except ImportError:
-                self.log.error('influxdb.client.InfluxDBClient import failed. '
-                               'Handler disabled')
-                self.enabled = False
-                return
 
         # Initialize Options
         if self.config['ssl'] == "True":
@@ -88,16 +69,29 @@ class InfluxdbHandler(Handler):
         self.metric_max_cache = int(self.config['cache_size'])
         self.batch_count = 0
         self.time_precision = self.config['time_precision']
-        self.exclude_host_from_path = self.config['exclude_host_from_path']
+        self.influxdb_version = self.config['influxdb_version']
+        self.using_0_8 = False
+        self.naming_mode = self.config['naming_mode']
         self.tags = self.config['tags']
 
-        # Set tags['hostname'] to the hostname if it has not been overridden
-        # by the user passing a tags parameter
-        if ('hostname' in self.tags and
-            self.tags['hostname'] == 'localhost' and
-            self.tags['hostname'] != self.hostname):
-
-            self.tags['hostname'] = self.hostname
+        if self.influxdb_version in ['0.8', '.8']:
+            if not InfluxDB08Client:
+                self.log.error(
+                    'influxdb.influxdb08.client.InfluxDBClient import failed. '
+                    'Handler disabled')
+                self.enabled = False
+                return
+            else:
+                self.client = InfluxDB08Client
+                self.using_0_8 = True
+        else:
+            if not InfluxDBClient:
+                self.log.error('influxdb.client.InfluxDBClient import failed. '
+                               'Handler disabled')
+                self.enabled = False
+                return
+            else:
+                self.client = InfluxDBClient
 
         # Initialize Data
         self.batch = {}
@@ -119,17 +113,18 @@ class InfluxdbHandler(Handler):
             'port': 'Port',
             'ssl': 'set to True to use HTTPS instead of http',
             'batch_size': 'How many metrics to store before sending to the'
-            ' influxdb server',
+                          ' influxdb server',
             'cache_size': 'How many values to store in cache in case of'
-            ' influxdb failure',
+                          ' influxdb failure',
             'username': 'Username for connection',
             'password': 'Password for connection',
             'database': 'Database name',
             'time_precision': 'time precision in second(s), milisecond(ms) or '
-            'microsecond (u)',
-            'exclude_host_from_path': 'set to True to simplify the measurement'
-            ' name from "servers.<hostname>.metric" to "servers.metric"',
-            'tags': 'dict of tags to pass to influxdb for this host',
+                              'microsecond (u)',
+            'influxdb_version': 'InfluxDB API version, default 0.9',
+            'naming_mode': 'How to name the measurement when sending to '
+                           ' influxdb >=0.9. Valid options are: normal,'
+                           ' collector, metric'
         })
 
         return config
@@ -141,7 +136,6 @@ class InfluxdbHandler(Handler):
         config = super(InfluxdbHandler, self).get_default_config()
 
         config.update({
-            'client': 'influxdb09',
             'hostname': 'localhost',
             'port': 8086,
             'ssl': False,
@@ -151,10 +145,9 @@ class InfluxdbHandler(Handler):
             'batch_size': 1,
             'cache_size': 20000,
             'time_precision': 's',
-            'exclude_host_from_path': False,
-            'tags' : {
-                'hostname': 'localhost',
-            }
+            'influxdb_version': '0.9',
+            'naming_mode': 'normal',
+            'tags': {},
         })
 
         return config
@@ -165,22 +158,15 @@ class InfluxdbHandler(Handler):
         """
         self._close()
 
-    def _overwrite_metrics_path(self, path):
-        if not self.exclude_host_from_path:
-            return path
-
-        self.log.debug('Replacing metric path: {0} with {1}'.format(path, path.replace('.{}'.format(self.hostname), '')))
-        return path.replace('.{}'.format(self.hostname), '')
-
     def process(self, metric):
         if self.batch_count <= self.metric_max_cache:
             # Add the data to the batch
-            self.batch.setdefault(self._overwrite_metrics_path(metric.path),
-                                  []).append([metric.timestamp, metric.value])
+            self.batch.setdefault(metric.path, []).append(metric)
             self.batch_count += 1
         # If there are sufficient metrics, then pickle and send
         if self.batch_count >= self.batch_size and (
-                time.time() - self.batch_timestamp) > 2**self.time_multiplier:
+                time.time() - self.batch_timestamp) > (
+                2 ** self.time_multiplier):
             # Log
             self.log.debug(
                 "InfluxdbHandler: Sending batch sizeof : %d/%d after %fs",
@@ -197,32 +183,75 @@ class InfluxdbHandler(Handler):
                 self.batch_count,
                 (time.time() - self.batch_timestamp))
 
-    def _build_payload_influxdb09(self, batch):
-        metrics = []
-        for path in batch:
-            metrics.append({
-                "measurement": path,
-                "time": batch[path][0][0],
-                "fields": {
-                    "value": batch[path][0][1],
-                }
-            })
-        return metrics
+    def _get_metric_name(self, metric):
+        """
+        Get the modified name for the metric to send to influxdb.
+        Modes:
+            normal: sends the metric name exactly as diamond specified
+            collector: sends the name of the collector as the metric name
+            metric: sends collector.metric as the metric name
+        """
 
-    def _build_payload_influxdb08(self, batch):
+        if self.naming_mode == 'collector':
+            return metric.getCollectorPath()
+
+        if self.naming_mode == 'metric':
+            return '{0}.{1}'.format(metric.getCollectorPath(),
+                                    metric.getMetricPath())
+
+        return metric.path
+
+    def _get_value_field_name(self, metric):
+        """
+        Get the modified name for the value field to send to influxdb.
+        Modes:
+            normal: sends 'value' as the field name
+            collector: sends the name of the metric as the field name
+            metric: sends 'value' as the field name
+        """
+        if self.naming_mode == 'collector':
+            return metric.getMetricPath()
+
+        return "value"
+
+    def _format_metrics(self):
+        """
+        Build list of metrics formatted for the influxdb client.
+        """
         metrics = []
-        for path in batch:
-            metrics.append({
-                "name": path,
-                "columns": ["time", "value"],
-                "points": batch[path]
-            })
+
+        if self.using_0_8:
+            for path in self.batch:
+                metrics.append({
+                    "points": [[metric.timestamp, metric.value] for metric in
+                               self.batch[path]],
+                    "name": path,
+                    "columns": ["time", "value"]})
+        else:
+            tags = dict.copy(self.tags)
+            for path in self.batch:
+                for metric in self.batch[path]:
+                    # Cast to float to ensure it's written as a float in
+                    # InfluxDB. This prevents future errors where the data type
+                    # of a field in InfluxDB is 'int', but we try to write a
+                    # float to that field.
+                    value = metric.value
+                    if isinstance(value, integer_types):
+                        value = float(value)
+
+                    tags.update({"host": metric.host})
+                    metrics.append({
+                        "measurement": self._get_metric_name(metric),
+                        "time": metric.timestamp,
+                        "fields": {self._get_value_field_name(metric): value},
+                        "tags": tags
+                    }),
+
         return metrics
 
     def _send(self):
         """
         Send data to Influxdb. Data that can not be sent will be kept in queued.
-
         """
         # Check to see if we have a valid socket. If not, try to connect.
         try:
@@ -233,12 +262,13 @@ class InfluxdbHandler(Handler):
             if self.influx is None:
                 self.log.debug("InfluxdbHandler: Reconnect failed.")
             else:
-                metrics = self._build_payload(self.batch)
+                # Build metrics.
+                metrics = self._format_metrics()
+
                 # Send data to influxdb
                 self.log.debug("InfluxdbHandler: writing %d series of data",
                                len(metrics))
                 self.influx.write_points(metrics,
-                                         tags=self.tags,
                                          time_precision=self.time_precision)
 
                 # empty batch buffer
@@ -252,7 +282,7 @@ class InfluxdbHandler(Handler):
                 self.time_multiplier += 1
             self._throttle_error(
                 "InfluxdbHandler: Error sending metrics, waiting for %ds.",
-                2**self.time_multiplier)
+                2 ** self.time_multiplier)
             raise
 
     def _connect(self):
@@ -262,9 +292,9 @@ class InfluxdbHandler(Handler):
 
         try:
             # Open Connection
-            self.influx = self._InfluxDBClient(self.hostname, self.port,
-                                               self.username, self.password,
-                                               self.database, self.ssl)
+            self.influx = self.client(self.hostname, self.port,
+                                      self.username, self.password,
+                                      self.database, self.ssl)
             # Log
             self.log.debug("InfluxdbHandler: Established connection to "
                            "%s:%d/%s.",
@@ -283,3 +313,4 @@ class InfluxdbHandler(Handler):
         Close the socket = do nothing for influx which is http stateless
         """
         self.influx = None
+
