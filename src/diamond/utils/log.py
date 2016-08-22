@@ -36,7 +36,6 @@ def setup_logging(configfile, stdout=False):
     log = logging.getLogger('diamond')
 
     if stdout:
-        log.setLevel(logging.DEBUG)
         streamHandler = logging.StreamHandler(sys.stdout)
         streamHandler.setFormatter(DebugFormatter())
         streamHandler.setLevel(logging.DEBUG)
